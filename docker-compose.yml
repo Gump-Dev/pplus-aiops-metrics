@@ -1,0 +1,20 @@
+services:
+  aiops-metrics-backend:
+    build: ./backend
+    container_name: aiops-metrics-backend
+    environment:
+      AI_URL: http://10.1.10.202:18789
+      AI_KEY: 613f25c27932059e3ba70a4e85fa1626b9c0d7a4cd902a77
+      AI_MODEL: anthropic/claude-haiku-4-5
+    ports:
+      - "8098:8000"
+    restart: unless-stopped
+
+  aiops-metrics-frontend:
+    build: ./frontend
+    container_name: aiops-metrics-frontend
+    ports:
+      - "3098:80"
+    depends_on:
+      - aiops-metrics-backend
+    restart: unless-stopped
