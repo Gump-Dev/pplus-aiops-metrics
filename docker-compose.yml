@@ -6,9 +6,12 @@ services:
       AI_URL: http://10.1.10.202:18789
       AI_KEY: 613f25c27932059e3ba70a4e85fa1626b9c0d7a4cd902a77
       AI_MODEL: anthropic/claude-haiku-4-5
+      VM_URL: http://host-gateway:8428
     ports:
       - "8098:8000"
     restart: unless-stopped
+    extra_hosts:
+      - "host-gateway:host-gateway"
 
   aiops-metrics-frontend:
     build: ./frontend
@@ -18,3 +21,12 @@ services:
     depends_on:
       - aiops-metrics-backend
     restart: unless-stopped
+
+  vm-collector:
+    build: ./collector
+    container_name: aiops-vm-collector
+    environment:
+      VM_URL: http://host-gateway:8428
+    restart: unless-stopped
+    extra_hosts:
+      - "host-gateway:host-gateway"

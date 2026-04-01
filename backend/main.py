@@ -3,16 +3,17 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from typing import Optional, List
-import requests, os, json, jwt
+import requests, os, json, jwt, time
 from datetime import datetime, timezone, timedelta
 
-app = FastAPI(title="PPLUS AI-Ops Metrics", version="1.0.0")
+app = FastAPI(title="PPLUS AI-Ops Metrics", version="1.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True,
                    allow_methods=["*"], allow_headers=["*"])
 
 # ── Config ──────────────────────────────────────────────
 ZABBIX_URL   = "http://172.24.2.243/zabbix/api_jsonrpc.php"
 ZABBIX_TOKEN = "c0507cfc75f77bc480c6929e6527236e"
+VM_URL       = os.getenv("VM_URL", "http://host-gateway:8428")
 
 AI_URL   = os.getenv("AI_URL",   "http://10.1.10.202:18789")
 AI_KEY   = os.getenv("AI_KEY",   "613f25c27932059e3ba70a4e85fa1626b9c0d7a4cd902a77")
@@ -25,7 +26,7 @@ security = HTTPBearer(auto_error=False)
 
 SYSTEM_PROMPT = """คุณเป็น AI Infrastructure Analyst ของ PPLUS ชื่อ "PPLUS-AIOps-M1.0"
 สำคัญ: standalone AI ไม่มี memory search/tools/functions - ตอบจาก Context เท่านั้น
-ข้อมูล: Zabbix 40 hosts, real-time CPU/memory/disk/network/problems
+ข้อมูล: Zabbix 40 hosts, real-time CPU/memory/disk/network/problems + VictoriaMetrics historical trends
 ตอบภาษาไทยหรืออังกฤษตามที่ถาม, ใช้ markdown table เมื่อเหมาะสม"""
 
 # ── Zabbix Helper ────────────────────────────────────────
@@ -47,8 +48,36 @@ def get_zabbix_summary():
         "problems": int(problems) if problems else 0
     }
 
+# ── VictoriaMetrics Helper ───────────────────────────────
+def query_vm(promql: str) -> list:
+    """Query VictoriaMetrics with PromQL (instant query)"""
+    try:
+        r = requests.get(f"{VM_URL}/api/v1/query",
+                        params={"query": promql},
+                        timeout=5)
+        if r.status_code == 200:
+            data = r.json().get("data", {}).get("result", [])
+            return data
+    except:
+        pass
+    return []
+
+def query_vm_range(promql: str, hours: int = 1) -> list:
+    """Query VictoriaMetrics range for trends"""
+    try:
+        end = int(time.time())
+        start = end - (hours * 3600)
+        r = requests.get(f"{VM_URL}/api/v1/query_range",
+                        params={"query": promql, "start": start, "end": end, "step": "5m"},
+                        timeout=10)
+        if r.status_code == 200:
+            return r.json().get("data", {}).get("result", [])
+    except:
+        pass
+    return []
+
 def build_context(message: str) -> str:
-    """Always-rich context: fetch all Zabbix data every query"""
+    """Always-rich context: fetch all Zabbix data + VM historical trends every query"""
     context_parts = []
 
     # 1. Summary
@@ -125,12 +154,90 @@ def build_context(message: str) -> str:
         "limit": 10
     })
     if net_items:
-            context_parts.append("=== Top Network Interface Traffic ===")
-            for it in items:
-                host_name = it.get("hosts", [{}])[0].get("name", "unknown") if it.get("hosts") else "unknown"
-                val = float(it.get("lastvalue", 0))
-                mbps = val / 1_000_000
-                context_parts.append(f"- {host_name} | {it.get('name','')} | {mbps:.2f} Mbps")
+        context_parts.append("=== Top Network Interface Traffic ===")
+        for it in net_items:
+            host_name = it.get("hosts", [{}])[0].get("name", "unknown") if it.get("hosts") else "unknown"
+            val = float(it.get("lastvalue", 0))
+            mbps = val / 1_000_000
+            context_parts.append(f"- {host_name} | {it.get('name','')} | {mbps:.2f} Mbps")
+
+    # 7. Historical trends from VictoriaMetrics (last 1h)
+    cpu_trend = query_vm("topk(5, zabbix_cpu_util)")
+    if cpu_trend:
+        context_parts.append("=== CPU Trend (current top 5, from VictoriaMetrics) ===")
+        for metric in cpu_trend:
+            host = metric.get("metric", {}).get("host", "unknown")
+            val = float(metric.get("value", [0, "0"])[1])
+            context_parts.append(f"- {host}: {val:.1f}%")
+
+    # CPU hosts that spiked in last 1h
+    cpu_history = query_vm_range("max_over_time(zabbix_cpu_util[1h])", hours=1)
+    if cpu_history:
+        high_cpu = []
+        for m in cpu_history:
+            if m.get("values"):
+                host = m.get("metric", {}).get("host", "?")
+                max_val = max(float(v[1]) for v in m["values"])
+                high_cpu.append((host, max_val))
+        high_cpu = [(h, v) for h, v in high_cpu if v > 80]
+        if high_cpu:
+            context_parts.append("=== Hosts with CPU > 80% in last 1h (VictoriaMetrics) ===")
+            for host, val in sorted(high_cpu, key=lambda x: -x[1])[:5]:
+                context_parts.append(f"- {host}: max {val:.1f}%")
+
+    # Memory trend from VM
+    mem_trend = query_vm("topk(5, zabbix_memory_util)")
+    if mem_trend:
+        context_parts.append("=== Memory Trend (current top 5, from VictoriaMetrics) ===")
+        for metric in mem_trend:
+            host = metric.get("metric", {}).get("host", "unknown")
+            val = float(metric.get("value", [0, "0"])[1])
+            context_parts.append(f"- {host}: {val:.1f}%")
+
+    # 7. Device-specific: FortiGate
+    forti_hosts = zabbix_api("host.get", {
+        "output": ["hostid", "host", "name", "available"],
+        "search": {"name": "Fortigate"},
+        "searchCaseSensitive": False
+    })
+    if forti_hosts:
+        context_parts.append("=== FortiGate Devices ===")
+        for h in forti_hosts:
+            avail = {"0":"unknown","1":"available","2":"unavailable"}.get(str(h.get("available","0")), "unknown")
+            context_parts.append(f"- {h['name']} ({h['host']}) | Status: {avail}")
+            # Get FortiGate items
+            items = zabbix_api("item.get", {
+                "output": ["name", "lastvalue", "units", "key_"],
+                "hostids": [h["hostid"]],
+                "limit": 20,
+                "sortfield": "name"
+            })
+            for it in items[:10]:
+                val = it.get("lastvalue","")
+                if val and val != "0":
+                    context_parts.append(f"  · {it['name']}: {val} {it.get('units','')}")
+
+    # 8. Device-specific: Juniper EX4300
+    juniper_hosts = zabbix_api("host.get", {
+        "output": ["hostid", "host", "name", "available"],
+        "search": {"name": "EX4300"},
+        "searchCaseSensitive": False
+    })
+    if juniper_hosts:
+        context_parts.append("=== Juniper EX4300 Devices ===")
+        for h in juniper_hosts:
+            avail = {"0":"unknown","1":"available","2":"unavailable"}.get(str(h.get("available","0")), "unknown")
+            context_parts.append(f"- {h['name']} ({h['host']}) | Status: {avail}")
+            items = zabbix_api("item.get", {
+                "output": ["name", "lastvalue", "units", "key_"],
+                "hostids": [h["hostid"]],
+                "limit": 20,
+                "sortfield": "name"
+            })
+            for it in items[:10]:
+                val = it.get("lastvalue","")
+                if val and val != "0":
+                    context_parts.append(f"  · {it['name']}: {val} {it.get('units','')}")
 
     return "\n".join(context_parts)
 
@@ -162,16 +269,29 @@ def verify_token(creds: Optional[HTTPAuthorizationCredentials] = Depends(securit
 @app.get("/health")
 def health():
     summary = get_zabbix_summary()
+    # Check VM status
+    vm_status = "ok"
+    try:
+        r = requests.get(f"{VM_URL}/health", timeout=3)
+        vm_status = "ok" if r.status_code == 200 else "error"
+    except:
+        vm_status = "unavailable"
     return {
         "status": "ok",
         "zabbix_hosts": summary["hosts"],
         "zabbix_problems": summary["problems"],
+        "victoriametrics": vm_status,
         "time": datetime.now(timezone(timedelta(hours=7))).strftime("%Y-%m-%d %H:%M BKK")
     }
 
 @app.get("/api/zabbix/summary")
 def zabbix_summary(auth=Depends(verify_token)):
     return get_zabbix_summary()
+
+@app.get("/api/vm/query")
+def vm_query(q: str, auth=Depends(verify_token)):
+    """Query VictoriaMetrics directly"""
+    return {"result": query_vm(q)}
 
 class ChatMessage(BaseModel):
     role: str
