@@ -48,86 +48,83 @@ def get_zabbix_summary():
     }
 
 def build_context(message: str) -> str:
-    msg_lower = message.lower()
+    """Always-rich context: fetch all Zabbix data every query"""
     context_parts = []
 
-    # Always include summary
+    # 1. Summary
     summary = get_zabbix_summary()
-    context_parts.append(f"=== Zabbix Summary ===\nHosts: {summary['hosts']}, Active Problems: {summary['problems']}")
+    context_parts.append(f"=== Zabbix Summary ===\nTotal Hosts: {summary['hosts']}, Active Problems: {summary['problems']}")
 
-    # Problems
-    if any(k in msg_lower for k in ["problem", "alert", "critical", "ปัญหา", "warning"]):
-        probs = zabbix_api("problem.get", {
-            "recent": True, "limit": 20,
-            "selectHosts": ["host", "name"],
-            "sortfield": "severity", "sortorder": "DESC",
-            "output": ["eventid", "name", "severity", "clock"]
-        })
-        if probs:
-            context_parts.append("=== Active Problems (Top 20) ===")
-            severity_map = {"0":"Not classified","1":"Info","2":"Warning","3":"Average","4":"High","5":"Disaster"}
-            for p in probs:
-                host_name = p.get("hosts", [{}])[0].get("name", "unknown") if p.get("hosts") else "unknown"
-                sev = severity_map.get(str(p.get("severity","0")), "unknown")
-                ts = datetime.fromtimestamp(int(p.get("clock",0)), tz=timezone(timedelta(hours=7))).strftime("%Y-%m-%d %H:%M")
-                context_parts.append(f"- [{sev}] {p.get('name','')} | Host: {host_name} | Time: {ts}")
+    # 2. ALL Active Problems (always)
+    probs = zabbix_api("problem.get", {
+        "recent": True, "limit": 30,
+        "selectHosts": ["host", "name"],
+        "sortfield": "severity", "sortorder": "DESC",
+        "output": ["eventid", "name", "severity", "clock"]
+    })
+    if probs:
+        context_parts.append("=== Active Problems ===")
+        severity_map = {"0":"Not classified","1":"Info","2":"Warning","3":"Average","4":"High","5":"Disaster"}
+        for p in probs:
+            host_name = p.get("hosts", [{}])[0].get("name", "unknown") if p.get("hosts") else "unknown"
+            sev = severity_map.get(str(p.get("severity","0")), "unknown")
+            ts = datetime.fromtimestamp(int(p.get("clock",0)), tz=timezone(timedelta(hours=7))).strftime("%Y-%m-%d %H:%M")
+            context_parts.append(f"- [{sev}] {p.get('name','')} | Host: {host_name} | Time: {ts}")
+    else:
+        context_parts.append("=== Active Problems ===\n- No active problems")
 
-    # CPU
-    if any(k in msg_lower for k in ["cpu", "load", "process"]):
-        items = zabbix_api("item.get", {
-            "output": ["name", "lastvalue", "hosts"],
-            "selectHosts": ["name"],
-            "search": {"key_": "system.cpu.util"},
-            "sortfield": "lastvalue", "sortorder": "DESC",
-            "limit": 10
-        })
-        if items:
-            context_parts.append("=== Top CPU Utilization (Top 10) ===")
-            for it in items:
-                host_name = it.get("hosts", [{}])[0].get("name", "unknown") if it.get("hosts") else "unknown"
-                val = float(it.get("lastvalue", 0))
-                context_parts.append(f"- {host_name}: {val:.1f}%")
+    # 3. ALL Hosts with availability (always)
+    hosts = zabbix_api("host.get", {
+        "output": ["host", "name", "available", "status"],
+        "limit": 60
+    })
+    if hosts:
+        avail_map = {"0":"unknown","1":"available","2":"unavailable"}
+        context_parts.append("=== All Hosts Status ===")
+        for h in hosts:
+            avail = avail_map.get(str(h.get("available","0")), "unknown")
+            status = "Enabled" if str(h.get("status","0")) == "0" else "Disabled"
+            context_parts.append(f"- {h.get('name',h.get('host',''))} | {avail} | {status}")
 
-    # Memory
-    if any(k in msg_lower for k in ["memory", "ram", "mem", "หน่วยความจำ"]):
-        items = zabbix_api("item.get", {
-            "output": ["name", "lastvalue"],
-            "selectHosts": ["name"],
-            "search": {"key_": "vm.memory.utilization"},
-            "sortfield": "lastvalue", "sortorder": "DESC",
-            "limit": 10
-        })
-        if items:
-            context_parts.append("=== Top Memory Utilization (Top 10) ===")
-            for it in items:
-                host_name = it.get("hosts", [{}])[0].get("name", "unknown") if it.get("hosts") else "unknown"
-                val = float(it.get("lastvalue", 0))
-                context_parts.append(f"- {host_name}: {val:.1f}%")
+    # 4. Top CPU (always)
+    cpu_items = zabbix_api("item.get", {
+        "output": ["name", "lastvalue"],
+        "selectHosts": ["name"],
+        "search": {"key_": "system.cpu.util"},
+        "sortfield": "lastvalue", "sortorder": "DESC",
+        "limit": 10
+    })
+    if cpu_items:
+        context_parts.append("=== Top CPU Utilization ===")
+        for it in cpu_items:
+            host_name = it.get("hosts", [{}])[0].get("name", "unknown") if it.get("hosts") else "unknown"
+            val = float(it.get("lastvalue", 0))
+            context_parts.append(f"- {host_name}: {val:.1f}%")
 
-    # Hosts
-    if any(k in msg_lower for k in ["host", "device", "server", "status", "list", "รายการ", "ทั้งหมด"]):
-        hosts = zabbix_api("host.get", {
-            "output": ["host", "name", "available", "status"],
-            "limit": 50
-        })
-        if hosts:
-            avail_map = {"0":"unknown","1":"available","2":"unavailable"}
-            context_parts.append("=== All Hosts ===")
-            for h in hosts:
-                avail = avail_map.get(str(h.get("available","0")), "unknown")
-                status = "Enabled" if str(h.get("status","0")) == "0" else "Disabled"
-                context_parts.append(f"- {h.get('name',h.get('host',''))} | Availability: {avail} | Status: {status}")
+    # 5. Top Memory (always)
+    mem_items = zabbix_api("item.get", {
+        "output": ["name", "lastvalue"],
+        "selectHosts": ["name"],
+        "search": {"key_": "vm.memory.utilization"},
+        "sortfield": "lastvalue", "sortorder": "DESC",
+        "limit": 10
+    })
+    if mem_items:
+        context_parts.append("=== Top Memory Utilization ===")
+        for it in mem_items:
+            host_name = it.get("hosts", [{}])[0].get("name", "unknown") if it.get("hosts") else "unknown"
+            val = float(it.get("lastvalue", 0))
+            context_parts.append(f"- {host_name}: {val:.1f}%")
 
-    # Network
-    if any(k in msg_lower for k in ["bandwidth", "traffic", "interface", "network", "เน็ต"]):
-        items = zabbix_api("item.get", {
-            "output": ["name", "lastvalue"],
-            "selectHosts": ["name"],
-            "search": {"name": "Bits received"},
-            "sortfield": "lastvalue", "sortorder": "DESC",
-            "limit": 10
-        })
-        if items:
+    # 6. Network (always - top 10 interfaces)
+    net_items = zabbix_api("item.get", {
+        "output": ["name", "lastvalue"],
+        "selectHosts": ["name"],
+        "search": {"name": "Bits received"},
+        "sortfield": "lastvalue", "sortorder": "DESC",
+        "limit": 10
+    })
+    if net_items:
             context_parts.append("=== Top Network Interface Traffic ===")
             for it in items:
                 host_name = it.get("hosts", [{}])[0].get("name", "unknown") if it.get("hosts") else "unknown"
